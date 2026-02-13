@@ -1,9 +1,10 @@
 # Noble (노블) — Product Requirements Document v2.0
 
-> **Document Status:** Final Draft
+> **Document Status:** Final Draft (v2.2)
 > **Last Updated:** 2025-02-13
 > **Author:** Noble Product Team
 > **Phase:** Phase 0 MVP → Phase 1 → Phase 2
+> **주요 변경 (v2.2):** 40개 기술 스펙 확정 (17개 의사결정 + 23개 상세 정의)
 
 ---
 
@@ -79,7 +80,8 @@
 |--------|------|------|----------|
 | **프론트엔드/API** | Next.js | 14+ (App Router) | Vercel 무료 배포, API Routes 내장, RSC 지원 |
 | **호스팅 (대시보드)** | Vercel | Free tier | 자동 배포, 서버리스 함수, 글로벌 CDN |
-| **호스팅 (블로그)** | Cloudflare Pages | Free tier | 500빌드/월, 무제한 요청, 커스텀 도메인+SSL 무료 |
+| **빌드 파이프라인** | Cloudflare Workers | - | **별도 분리**, Vercel 10초 타임아웃 회피 |
+| **호스팅 (블로그)** | Cloudflare Pages | **Pro $20/월** | 무제한 빌드, 무제한 요청, 커스텀 도메인+SSL |
 | **DB** | Supabase PostgreSQL | Free tier | 500MB DB, 1GB 파일, Auth 내장, RLS 보안 |
 | **인증** | Supabase Auth | - | Magic Link + Google OAuth, JWT 자동 관리 |
 | **이미지 저장** | Cloudflare R2 | Free tier | 10GB 저장, 10M reads/월, S3 호환 API |
@@ -92,14 +94,19 @@
 
 | 시나리오 | 유저 수 | 월 수령액 | 월 인프라 비용 | 월 순이익 |
 |---------|---------|----------|-------------|----------|
-| 초기 | 50명 | $402 | ~$0 (무료 티어) | **$402** |
-| 성장기 | 200명 | $1,610 | ~$25 (Supabase Pro) | **$1,585** |
-| 안정기 | 500명 | $4,025 | ~$65 | **$3,960** |
-| 스케일 | 1,000명 | $8,050 | ~$120 | **$7,930** |
+| 초기 | 50명 | $402 | **~$20** (CF Pages Pro) | **$382** |
+| 성장기 | 200명 | $1,610 | ~$45 (CF Pro + Supabase Pro) | **$1,565** |
+| 안정기 | 500명 | $4,025 | ~$85 | **$3,940** |
+| 스케일 | 1,000명 | $8,050 | ~$140 | **$7,910** |
 
-무료 티어 한계 도달 시점:
+> ⚠️ **Phase 0부터 Cloudflare Pages Pro ($20/월) 사용** — 무료 티어 500빌드/월 한계
+
+필수 비용 (Day 1부터):
+- Cloudflare Pages Pro: $20/월 (무제한 빌드)
+- Cloudflare Workers: 무료 티어 충분 (100,000 req/일)
+
+스케일 시점:
 - Supabase: ~500명 (DB 500MB) → Pro $25/월
-- Cloudflare Pages: 500빌드/월 → ~50명(일 배포 평균 기준) 이후 Pro $20/월
 - Vercel: 100GB 대역폭 → ~1,000명 이후 Pro $20/월
 
 ---
@@ -118,10 +125,10 @@ CREATE TABLE public.users (
   display_name    TEXT,
   avatar_url      TEXT,
   
-  -- 플랜 정보
+  -- 플랜 정보 (Phase 0: Pro만)
   plan            TEXT NOT NULL DEFAULT 'trial'
-                  CHECK (plan IN ('trial', 'pro', 'business')),
-  trial_ends_at   TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '14 days'),
+                  CHECK (plan IN ('trial', 'pro')),
+  trial_ends_at   TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days'),
   
   -- Paddle 연동
   paddle_customer_id    TEXT,
@@ -153,6 +160,7 @@ CREATE TABLE public.sites (
   
   -- Notion 연동
   notion_token_encrypted  BYTEA NOT NULL,     -- AES-256-GCM 암호화된 access_token
+  encryption_version      INTEGER NOT NULL DEFAULT 1, -- 암호화 키 버전 (키 로테이션 지원)
   notion_workspace_id     TEXT NOT NULL,
   notion_workspace_name   TEXT,
   notion_database_id      TEXT NOT NULL UNIQUE, -- 중복 연동 방지
@@ -166,6 +174,7 @@ CREATE TABLE public.sites (
   default_og_image_url    TEXT,               -- 기본 OG 이미지
   default_meta_description TEXT,              -- 기본 meta description
   robots_allow_crawling   BOOLEAN NOT NULL DEFAULT TRUE,
+  toc_enabled             BOOLEAN NOT NULL DEFAULT TRUE, -- 목차 자동 생성 여부 (유저 선택)
   
   -- 빌드 상태
   last_build_status TEXT DEFAULT 'never'
@@ -344,13 +353,22 @@ CREATE TRIGGER posts_updated_at BEFORE UPDATE ON public.posts
   FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 ```
 
-### 3.2 Notion 토큰 암호화
+### 3.2 Notion 토큰 암호화 (버전 관리 지원)
 
 ```
 알고리즘: AES-256-GCM
-키: 환경변수 ENCRYPTION_KEY (32바이트)
+키: 환경변수 ENCRYPTION_KEY_V1, ENCRYPTION_KEY_V2, ... (버전별 32바이트)
 IV: 매 암호화마다 랜덤 12바이트 생성
-저장 형식: [IV(12bytes)][TAG(16bytes)][ENCRYPTED_DATA]
+저장 형식: [VERSION(1byte)][IV(12bytes)][TAG(16bytes)][ENCRYPTED_DATA]
+DB 컬럼: sites.encryption_version INTEGER (암호화 시 사용된 키 버전)
+```
+
+키 로테이션 전략:
+```
+1. 새 키 추가: ENCRYPTION_KEY_V2 환경변수 추가
+2. 암호화: 항상 최신 버전 (V2) 사용
+3. 복호화: encryption_version 컬럼 참조하여 해당 버전 키 사용
+4. 마이그레이션: 배치 작업으로 기존 토큰을 새 키로 재암호화 (선택)
 ```
 
 암호화/복호화 유틸:
@@ -359,21 +377,30 @@ IV: 매 암호화마다 랜덤 12바이트 생성
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 
 const ALGORITHM = 'aes-256-gcm';
-const KEY = Buffer.from(process.env.ENCRYPTION_KEY!, 'hex'); // 64자 hex = 32bytes
+const CURRENT_VERSION = 1; // 현재 암호화 버전
+const KEYS: Record<number, Buffer> = {
+  1: Buffer.from(process.env.ENCRYPTION_KEY_V1!, 'hex'),
+  // 2: Buffer.from(process.env.ENCRYPTION_KEY_V2!, 'hex'), // 로테이션 시 추가
+};
 
-export function encrypt(text: string): Buffer {
+export function encrypt(text: string): { encrypted: Buffer; version: number } {
   const iv = randomBytes(12);
-  const cipher = createCipheriv(ALGORITHM, KEY, iv);
+  const cipher = createCipheriv(ALGORITHM, KEYS[CURRENT_VERSION], iv);
   const encrypted = Buffer.concat([cipher.update(text, 'utf8'), cipher.final()]);
   const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, encrypted]); // 12 + 16 + N bytes
+  return {
+    encrypted: Buffer.concat([iv, tag, encrypted]), // 12 + 16 + N bytes
+    version: CURRENT_VERSION,
+  };
 }
 
-export function decrypt(data: Buffer): string {
+export function decrypt(data: Buffer, version: number): string {
+  const key = KEYS[version];
+  if (!key) throw new Error(`Unknown encryption version: ${version}`);
   const iv = data.subarray(0, 12);
   const tag = data.subarray(12, 28);
   const encrypted = data.subarray(28);
-  const decipher = createDecipheriv(ALGORITHM, KEY, iv);
+  const decipher = createDecipheriv(ALGORITHM, key, iv);
   decipher.setAuthTag(tag);
   return decipher.update(encrypted) + decipher.final('utf8');
 }
@@ -598,11 +625,21 @@ Flow:
 
 ## 5. 빌드 파이프라인 상세
 
+### 5.0 아키텍처 결정 사항
+
+> ⚠️ **빌드 파이프라인은 Cloudflare Workers에서 실행**
+
+| 문제 | 원인 | 해결 |
+|------|------|------|
+| Vercel 타임아웃 | 무료 10초, Pro 60초 제한 | **Cloudflare Workers 분리** |
+| 빌드 시간 | 50 포스트 기준 30초+ 예상 | Workers CPU 30초, Wall 무제한 |
+| 대안 | Railway ($5/월), Render | Workers 무료 티어로 충분 |
+
 ### 5.1 전체 빌드 플로우
 
 ```
-[트리거] → [Notion 데이터 수집] → [마크다운 변환] → [이미지 처리]
-        → [HTML 생성] → [SEO 자동화] → [Cloudflare 배포] → [완료]
+[트리거 (Vercel API)] → [Workers 호출] → [Notion 데이터 수집] → [이미지 처리]
+                     → [HTML 생성] → [SEO 자동화] → [CF Pages 배포] → [완료 콜백]
 ```
 
 ### 5.2 단계별 상세
@@ -693,6 +730,21 @@ Rich Text 인라인 변환:
 5. HTML 내 이미지 URL을 R2 URL로 교체
 6. lazy loading 속성 추가: loading="lazy"
 7. width/height 속성 추가 → CLS(Cumulative Layout Shift) 방지
+```
+
+#### sharp 서버리스 호환성 방안 (3가지)
+
+| 방안 | 설명 | 장점 | 단점 |
+|------|------|------|------|
+| **1. @img/sharp-linux-x64** | Lambda 전용 네이티브 바이너리 | 기존 코드 유지, 검증됨 | 패키지 크기 증가 |
+| **2. CF Workers images.transform** | Cloudflare 내장 이미지 변환 API | 별도 설치 불필요 | Workers Pro 필요 |
+| **3. 외부 서비스 (백업)** | Cloudinary/imgix 무료 티어 | 안정성 높음 | 외부 의존성 |
+
+**권장: 방안 1 → Workers에서는 방안 2로 전환 검토**
+
+```bash
+# Lambda 호환 sharp 설치
+npm install @img/sharp-linux-x64 --platform=linux --arch=x64
 ```
 
 #### Step 4: SEO 자동화
@@ -790,19 +842,24 @@ G. HTML 시맨틱 구조:
    </html>
 ```
 
-#### Step 5: TOC(목차) 생성
+#### Step 5: TOC(목차) 생성 — 유저 선택 사항
 
 ```
-1. 렌더링된 HTML에서 h1/h2/h3 태그 추출
-2. 각 헤딩에 id 부여: slugify(heading_text)
-3. 중첩 구조 생성:
+⚙️ 설정: sites.toc_enabled (기본값: true)
+   - toc_enabled = false → TOC 생성 스킵
+   - 온보딩 Step 2 또는 설정 > 일반에서 변경 가능
+
+1. toc_enabled 체크 → false면 스킵
+2. 렌더링된 HTML에서 h1/h2/h3 태그 추출
+3. 각 헤딩에 id 부여: slugify(heading_text)
+4. 중첩 구조 생성:
    H1
    ├── H2
    │   ├── H3
    │   └── H3
    └── H2
-4. 3개 미만 헤딩이면 TOC 미생성
-5. HTML 생성:
+5. 3개 미만 헤딩이면 TOC 미생성
+6. HTML 생성:
    <nav class="toc" aria-label="목차">
      <ol>
        <li><a href="#heading-1">제목 1</a>
@@ -812,7 +869,7 @@ G. HTML 시맨틱 구조:
        </li>
      </ol>
    </nav>
-6. CSS:
+7. CSS:
    - 데스크톱: position: sticky, 우측 사이드바
    - 모바일: 글 상단 접이식 (details/summary)
    - 스크롤 하이라이트: IntersectionObserver (JS 최소)
@@ -895,21 +952,22 @@ Noble Dashboard
 | **태그라인** | "노션으로 글만 쓰면, 구글에 잘 잡히는 블로그" |
 | **신뢰 문구** | "14일 무료 체험 · 카드 등록 불필요" |
 
-### 6.3 온보딩 위저드 (`/onboarding`)
+### 6.3 온보딩 위저드 (`/onboarding`) — 2단계
 
-4단계 스텝 위저드. 각 단계 완료 시 ✅ 표시, 프로그레스 바 시각 표시.
+**2단계 스텝 위저드** (기존 4단계에서 간소화). 각 단계 완료 시 ✅ 표시.
 
-#### Step 1: 노션 연동
+#### Step 1: Notion 연동 + DB 선택 + 속성 검증
 
 | 항목 | 스펙 |
 |------|------|
-| **메인 CTA** | "노션 연동하기" 버튼 → Notion OAuth 화면 이동 |
-| **안내 문구** | OAuth 버튼 위: "Notion 공식 API를 사용하여 안전하게 연동됩니다" |
-| **사전 가이드** | "블로그로 사용할 데이터베이스만 선택해 주세요" |
-| **URL 폴백** | "연동이 안 되시나요?" 클릭 → 숨겨진 URL 입력 필드 토글 |
-| **URL 파싱** | 정규식: `/([a-f0-9]{32})/` (32자 hex, `?v=` 이전까지) |
-| **Page vs DB** | Notion API `object` 필드 체크. page이면 → "데이터베이스 전체 주소를 입력해 주세요" |
-| **완료 조건** | access_token 저장 성공 |
+| **1-1 노션 연동** | "노션 연동하기" 버튼 → Notion OAuth 화면 이동 |
+| **안내 문구** | "Notion 공식 API를 사용하여 안전하게 연동됩니다" |
+| **URL 폴백** | "연동이 안 되시나요?" 클릭 → URL 입력 필드 토글 |
+| **1-2 DB 선택** | OAuth 완료 후 DB 목록 표시, 1개면 자동 선택 |
+| **중복 방지** | 이미 다른 계정에서 연동된 DB → "이미 연동된 데이터베이스입니다" |
+| **1-3 속성 검증** | DB 선택 즉시 자동 검증 (Title/Slug/Status) |
+| **없을 때** | 구체적 안내 + "다시 확인하기" 버튼 |
+| **완료 조건** | 노션 연동 + DB 선택 + 속성 ✅ 모두 완료 |
 
 OAuth URL 구성:
 ```
@@ -921,32 +979,7 @@ https://api.notion.com/v1/oauth/authorize
   &state={csrf_token}
 ```
 
-#### Step 2: DB 선택
-
-| 항목 | 스펙 |
-|------|------|
-| **데이터** | Notion API로 권한 부여된 DB 목록 조회 (`/v1/search`, filter: database) |
-| **표시 정보** | DB 이름 + 페이지 수 |
-| **자동 선택** | DB가 1개면 자동 선택 + 다음 단계 이동 |
-| **선택 제한** | 1개만 (Phase 0) |
-| **템플릿** | "처음부터 시작하고 싶으신가요? 노블 블로그 템플릿 복제하기" |
-| **중복 방지** | 이미 다른 계정에서 연동된 DB면 → "이미 연동된 데이터베이스입니다" 에러 |
-
-#### Step 3: 속성 확인
-
-| 항목 | 스펙 |
-|------|------|
-| **검사 속성** | Title(제목), Slug(텍스트), Status(셀렉트) |
-| **검사 방법** | `GET /v1/databases/{db_id}` → properties 필드에서 확인 |
-| **Title** | 모든 DB에 기본 존재 → 항상 ✅ |
-| **Slug 검사** | properties 중 type: "rich_text"이고 이름이 "Slug"인 속성 |
-| **Status 검사** | properties 중 type: "select"이고 이름이 "Status"인 속성 |
-| **Status 옵션** | "Published" 옵션 존재 여부 추가 확인 |
-| **없을 때** | 구체적 안내: "노션에서 '블로그 포스트' DB를 열고 텍스트 타입의 'Slug' 속성을 추가해주세요" |
-| **재확인** | "다시 확인하기" 버튼 → 속성 재검사 |
-| **자동 진행** | 모든 ✅이면 2초 뒤 자동으로 Step 4 이동 |
-
-#### Step 4: 블로그 URL 설정
+#### Step 2: 블로그 URL 설정 + TOC 설정
 
 | 항목 | 스펙 |
 |------|------|
@@ -956,11 +989,12 @@ https://api.notion.com/v1/oauth/authorize
 | **커스텀 도메인** | 선택사항. 입력 시 DNS 설정 안내 표시 |
 | **DNS 안내** | "CNAME 레코드를 추가해주세요: noble-cdn.pages.dev" |
 | **DNS 검증** | "DNS 확인하기" 버튼 → DNS lookup 실행 → 결과 표시 |
+| **TOC 설정** | 체크박스: "목차 자동 생성" (기본값: 켜짐) |
 | **완료 CTA** | "블로그 만들기" → 사이트 생성 + 첫 빌드 트리거 + `/dashboard` 이동 |
 
 ### 6.4 메인 대시보드 (`/dashboard`)
 
-사용자가 매일 보는 핵심 화면. "현재 상태 + 배포" 2가지만 집중.
+사용자가 매일 보는 핵심 화면. "현재 상태 + 배포 + 모니터링" 3가지 집중.
 
 #### 블로그 요약 카드
 
@@ -972,6 +1006,15 @@ https://api.notion.com/v1/oauth/authorize
 | 마지막 배포 | sites.last_build_at | 상대 시간 ("2시간 전") |
 | 블로그 상태 | sites.last_build_status | 🟢 정상 / 🟡 빌드중 / 🔴 실패 |
 
+#### 빌드 모니터링 카드 (신규)
+
+| 항목 | 데이터 소스 | 표시 형식 |
+|------|-----------|----------|
+| 빌드 성공률 | builds 최근 30일 | "95%" + 프로그레스 바 |
+| 평균 빌드 시간 | builds.build_duration_ms 평균 | "23초" |
+| 최근 빌드 | builds 최근 5개 | 미니 타임라인 (✅❌) |
+| 서비스 상태 | UptimeRobot API 연동 | 🟢 정상 / 🟡 점검 중 |
+
 #### SEO 현황 카드
 
 | 항목 | 동작 |
@@ -980,27 +1023,29 @@ https://api.notion.com/v1/oauth/authorize
 | RSS URL | `https://{domain}/rss.xml` + 📋 복사 버튼 |
 | 서치콘솔 가이드 | 외부 링크 (Google/Naver 각각) |
 
-#### 체험/결제 카드
+#### 체험/결제 카드 (Phase 0: Pro만)
 
 | 상태 | 표시 내용 |
 |------|----------|
-| **체험 중** | "남은 기간: N일" + 프로그레스 바 + "업그레이드" CTA |
-| **체험 D-3** | 배너: "체험 기간이 3일 남았습니다" (알림 배너에도 표시) |
-| **체험 만료** | "체험이 종료되었습니다. 업그레이드하여 블로그를 계속하세요" |
-| **유료 (정상)** | "Pro 플랜 · 다음 결제일: YYYY.MM.DD" |
-| **유료 (past_due)** | "결제에 실패했습니다. 결제 수단을 확인해주세요." + Paddle 링크 |
+| **체험 중** | "⏱️ 7일 무료 체험 중 · 남은 기간: N일" + 프로그레스 바 + [Pro 시작하기] |
+| **체험 D-3** | 주황 배경: "체험 기간이 3일 남았습니다" + [지금 업그레이드] |
+| **체험 D-1** | 빨간 배경: "내일 체험이 만료됩니다" + [지금 업그레이드] |
+| **체험 만료** | "체험이 종료되었습니다" + Pro 플랜 카드 + [시작하기] |
+| **Pro (정상)** | "🟢 Pro 플랜 · $9/월 · 다음 결제일: YYYY.MM.DD" |
+| **Pro (past_due)** | "결제에 실패했습니다" + [결제 수단 확인] |
 
 #### 알림 배너 (조건부, 우선순위 순)
 
-| 우선순위 | 조건 | 메시지 | CTA |
-|---------|------|-------|-----|
-| 1 🔴 | last_build_status = 'failed' | "마지막 배포가 실패했습니다" | [상세 보기] |
-| 2 🟡 | Notion API 401 감지 | "노션 연동이 해제되었습니다" | [재연동하기] |
-| 3 🟡 | trial D-3 이하 | "체험 기간이 N일 남았습니다" | [업그레이드] |
-| 4 🟡 | past_due | "결제에 실패했습니다" | [결제 수단 확인] |
-| 5 🔵 | 새 기능 출시 | "새 기능이 추가되었습니다!" | [알아보기] |
+| 우선순위 | 조건 | 메시지 | CTA | 추가 액션 |
+|---------|------|-------|-----|----------|
+| 1 🔴 | last_build_status = 'failed' | "마지막 배포가 실패했습니다" | [상세 보기] | - |
+| 2 🟡 | Notion API 401 감지 | "노션 연동이 해제되었습니다" | [재연동하기] | **자동 이메일 발송** |
+| 3 🟠 | trial D-3 | "체험 기간이 3일 남았습니다" | [업그레이드] | **푸시 이메일** |
+| 4 🟠 | trial D-1 | "체험 기간이 내일 만료됩니다" | [업그레이드] | **푸시 이메일** |
+| 5 🟡 | past_due | "결제에 실패했습니다" | [결제 수단 확인] | - |
+| 6 🔴 | trial 만료 | "체험 기간이 만료되었습니다" | [업그레이드] | - |
 
-동시 발생 시 최고 우선순위 1개만 표시.
+> 7일 체험 + D-3, D-1 푸시 강화. 동시 발생 시 최고 우선순위 1개만 표시.
 
 ### 6.5 포스트 관리 (`/posts`)
 
@@ -1016,9 +1061,9 @@ https://api.notion.com/v1/oauth/authorize
 | **페이지네이션** | 50개 초과 시 "더 보기" 버튼 |
 | **안내 문구** | 하단: "글 편집은 노션에서 직접 하세요. 편집 후 배포 버튼을 누르면 반영됩니다." |
 
-### 6.6 설정 (`/settings`)
+### 6.6 설정 (`/settings`) — 2개 탭
 
-4개 탭: 일반, SEO, 테마(Phase 1), 결제
+**2개 탭: 일반, 결제** (기존 4개에서 간소화. SEO/테마는 일반에 통합 또는 Phase 1)
 
 #### 일반 탭
 
@@ -1030,31 +1075,20 @@ https://api.notion.com/v1/oauth/authorize
 | 커스텀 도메인 | text input | 소문자 변환, DNS 검증 버튼 |
 | DNS 상태 | 읽기 전용 | ✅ 확인됨 / ❌ 미확인 / ⏳ 확인 중 |
 | 노션 연동 | 읽기 전용 | 워크스페이스 이름, DB 이름, [연동 해제] [다른 DB 선택] |
+| **목차 설정** | 체크박스 | "목차 자동 생성" (기본값: 켜짐) |
+| **SEO (간소화)** | Sitemap/RSS URL 복사 버튼 | 서치콘솔 가이드 링크 |
 
-#### SEO 탭
-
-| 필드 | 동작 |
-|------|------|
-| Sitemap URL | 읽기 전용 + 📋 복사 |
-| RSS URL | 읽기 전용 + 📋 복사 |
-| 서치콘솔 가이드 | 외부 링크 (Google, Naver) |
-| OG 이미지 | 라디오: 노션 커버(기본) / 커스텀 업로드 |
-| 기본 Meta Description | textarea, 0~160자 |
-| robots.txt | 체크박스: 크롤링 허용(기본 ON) / 차단 |
-
-#### 테마 탭 (Phase 1)
-
-Phase 0: "Coming Soon" 배지 + 3개 테마 프리뷰 이미지 (미니멀, 매거진, 다크). 클릭 불가.
-
-#### 결제 탭
+#### 결제 탭 (Phase 0: Pro만)
 
 | 상태 | 표시 내용 |
 |------|----------|
-| **체험 중** | 남은 일수 + Pro/Business 플랜 카드 2개 + [시작하기] CTA |
-| **유료** | 현재 플랜 이름, 금액, 다음 결제일, [업그레이드] [연간 전환] |
+| **체험 중** | 남은 일수 (7일 중) + Pro 플랜 카드 + [시작하기] CTA |
+| **Pro** | 현재 플랜 이름, 금액, 다음 결제일, [연간 전환 20%↓] |
 | **Paddle 관리** | [Paddle 결제 관리 열기] → paddle.net 외부 링크 |
 | **구독 취소** | [구독 취소하기] → 확인 모달 → Paddle cancel API |
 | **환불** | [환불 요청하기] → 14일 이내 자동승인, 초과 시 "검토 후 안내" |
+
+> Business 플랜은 Phase 1에서 수익화 기능과 함께 추가
 
 ### 6.7 글로벌 컴포넌트
 
@@ -1077,7 +1111,7 @@ Phase 0: "Coming Soon" 배지 + 3개 테마 프리뷰 이미지 (미니멀, 매�
 - 768~1023px: 60px (아이콘만)
 - ~767px: 숨김, 햄버거 메뉴 → 오버레이
 
-#### 배포 FAB (Floating Action Button)
+#### 배포 FAB (Floating Action Button) — 3개 상태
 
 | 항목 | 스펙 |
 |------|------|
@@ -1086,12 +1120,13 @@ Phase 0: "Coming Soon" 배지 + 3개 테마 프리뷰 이미지 (미니멀, 매�
 | **데스크톱** | 48px 높이 + "🚀 배포" 텍스트 |
 | **모바일** | 56×56px 원형, 🚀 아이콘만 |
 | **호버 툴팁** | "오늘 남은 배포: 8/10" |
-| **상태: 기본** | 파란색, 클릭 가능 |
-| **상태: 빌드중** | 회색, 비활성 + 스피너 + "배포 중..." |
-| **상태: 완료** | 초록색, "배포 완료!" → 3초 후 기본 복귀 |
-| **상태: 실패** | 빨간색, "배포 실패" → 클릭 시 에러 상세 |
-| **상태: 제한** | 회색, "오늘 배포 N/N" |
+| **상태: idle** | 파란색, 클릭 가능, "배포" |
+| **상태: building** | 회색, 비활성 + 스피너 + "배포 중..." |
+| **상태: done** | 초록/빨간색, "완료!"/"실패" → 3초 후 idle (실패 시 에러 모달) |
 | **z-index** | 최상위 (모달 아래) |
+
+> 기존 5개 상태(idle/building/success/failed/limited)에서 3개로 간소화.
+> limited/expired는 클릭 시 토스트로 안내.
 
 #### 토스트 알림
 
@@ -1159,6 +1194,29 @@ Rate Limit 대응:
   - 500/502/503 → Notion 서버 장애: 자동 재시도 → 실패 시 "노션 서버 장애"
 ```
 
+### 7.5 Notion API 의존 리스크 대응 (3가지)
+
+| 상황 | 감지 방법 | 대응 | 구현 |
+|------|----------|------|------|
+| **토큰 revoke** | API 401 응답 | 배너 + **자동 이메일 알림** | Resend API (필수) |
+| **Notion 장애** | timeout/5xx 빈발 | **상태 페이지** 연동 | UptimeRobot 무료 |
+| **API 사용량 제한** | 429 빈발 | 워크스페이스당 **빌드 큐잉** | 지연 + 안내 토스트 |
+
+```typescript
+// 토큰 revoke 감지 시 자동 이메일 발송
+async function handleNotionAuthError(siteId: string, userId: string) {
+  await supabase.from('sites').update({ notion_token_invalid: true }).eq('id', siteId);
+
+  await resend.emails.send({
+    from: 'Noble <noreply@noble.blog>',
+    to: user.email,
+    subject: '⚠️ 노션 연동이 해제되었습니다',
+    html: `<p>노션 연동이 해제되어 블로그 배포가 중단되었습니다.</p>
+           <a href="${BASE_URL}/settings">재연동하기</a>`
+  });
+}
+```
+
 ---
 
 ## 8. 결제 시스템 (Paddle)
@@ -1187,17 +1245,21 @@ Checkout 설정:
   - 사용자 식별: customer_email + custom_data.user_id
 ```
 
-### 8.2 플랜 및 가격
+### 8.2 플랜 및 가격 (Phase 0: Pro만)
 
 | 플랜 | 월간 | 연간 (20% 할인) | Paddle 수수료 | 실수령 |
 |------|------|---------------|-------------|--------|
 | **Pro** | $9/월 | $86/년 | $0.95/월 | $8.05/월 |
-| **Business** | $19/월 | $182/년 | $1.45/월 | $17.55/월 |
 
-### 8.3 체험 기간 로직
+> **Business 플랜 ($19/월)은 Phase 1에서 수익화 기능과 함께 출시**
+> - 애드센스 자동 배치
+> - 멤버십/유료 구독
+> - 무제한 배포
+
+### 8.3 체험 기간 로직 (7일 + 푸시 강화)
 
 ```
-체험 시작: 회원가입 시 자동 (trial_ends_at = NOW() + 14 days)
+체험 시작: 회원가입 시 자동 (trial_ends_at = NOW() + 7 days)
 체험 중 기능: Pro 전체 기능 (일 3회 배포 제한)
 체험 만료 체크:
   - 매 API 요청 시: trial_ends_at < NOW() 이면 → 기능 차단
@@ -1206,11 +1268,14 @@ Checkout 설정:
   - 블로그 서빙 중지 (Cloudflare 배포 유지하되 커스텀 도메인 해제)
   - 대시보드 접근 가능 (업그레이드 유도)
   - 데이터 30일 보관 → 이후 삭제
-알림:
-  - D-3: 대시보드 배너 + 이메일
-  - D-1: 이메일
-  - D+0: 이메일 (만료 안내 + 업그레이드 링크)
+알림 (강화):
+  - D-3: 대시보드 주황 배너 + **푸시 이메일** (강조)
+  - D-1: 대시보드 빨간 배너 + **푸시 이메일** (긴급)
+  - D+0: **푸시 이메일** (만료 안내 + 업그레이드 링크)
 ```
+
+> 14일 → 7일로 단축. 블로그 셋업은 10분이면 끝나므로 긴 체험은 불필요.
+> D-3, D-1 푸시로 전환율 향상.
 
 ### 8.4 배포 횟수 제한 로직
 
@@ -1490,11 +1555,13 @@ export async function withIdempotency<T>(
 | 리스크 | 확률 | 영향 | 대응 |
 |--------|------|------|------|
 | Notion API Rate Limit | 낮음 | 빌드 지연 | 빌드 타임 전용 (실시간 아님), 350ms 간격 |
-| Notion API 장애 | 중간 | 빌드 불가 | 캐시 유지, 장애 시 블로그 정상 서빙 |
-| Notion OAuth 토큰 revoke | 중간 | 빌드 불가 | 401 감지 → 재연동 배너 |
+| Notion API 장애 | 중간 | 빌드 불가 | **UptimeRobot 상태 페이지** 연동, 캐시 유지 |
+| Notion OAuth 토큰 revoke | 중간 | 빌드 불가 | 401 감지 → 재연동 배너 + **자동 이메일** |
 | "검토받지 않은 앱" 경고 | 높음 | 사용자 불안 | 안내 문구 + 유료 전환 시 Notion 리뷰 신청 |
 | Notion API Terms 변경 | 낮음 | 사업 중단 | 상업 사용 허용 확인, TOS 모니터링 |
-| Cloudflare 무료 한도 | 중간 | 빌드 한도 | 500빌드/월, 50유저 후 Pro($20) 검토 |
+| **Vercel 타임아웃** | 확실 | 빌드 불가 | **Cloudflare Workers 분리** (Day 1 적용) |
+| Cloudflare 무료 한도 | 확실 | 빌드 한도 | **Day 1부터 Pro $20/월 사용** |
+| sharp 서버리스 호환 | 중간 | 이미지 처리 실패 | @img/sharp-linux-x64 또는 CF images |
 | Notion 이미지 URL 만료 | 확실 | 이미지 깨짐 | 빌드 시 다운로드 → R2 저장 (필수) |
 | Paddle 계정 승인 지연 | 중간 | 결제 불가 | 사전 신청, 체험 기간으로 버퍼 |
 | 사용자 Notion 구조 다양성 | 높음 | 빌드 에러 | 엄격한 속성 검증 + 명확한 에러 메시지 |
@@ -1506,23 +1573,25 @@ export async function withIdempotency<T>(
 ### Phase 0 — MVP (목표: 5일)
 
 ```
-Day 1: 프로젝트 셋업 + Notion OAuth + 토큰 암호화 저장 + DB 선택
-Day 2: Notion API → 마크다운 변환 → 정적 HTML 빌드 파이프라인
-Day 3: SEO 자동화 (slug, meta, sitemap, RSS, robots.txt, OG) + 이미지 처리
-Day 4: 대시보드 UI (온보딩 + 메인 + 포스트 + 설정) + 배포 FAB + 커스텀 도메인
-Day 5: Paddle 연동 + QA + 랜딩 페이지 + 런칭
+Day 1: 프로젝트 셋업 + Notion OAuth + 2단계 온보딩 Step 1 (연동+DB+속성)
+Day 2: Cloudflare Workers 빌드 서버 + Notion→HTML + 이미지 처리 + 온보딩 Step 2
+Day 3: SEO 자동화 (slug, meta, sitemap, RSS, OG, TOC) + CF Pages Pro 배포 + 커스텀 도메인
+Day 4: 대시보드 UI (메인+모니터링 + 포스트 + 설정 2탭) + FAB 3상태 + FAQ
+Day 5: Paddle Pro 연동 + 7일 체험 + 모니터링 + QA + 런칭
 ```
 
 Phase 0 완료 기준 (Definition of Done):
 - [ ] 노션 OAuth 연동 + DB 선택 + 속성 검증 작동
-- [ ] 온보딩 4단계 위저드 완료
-- [ ] 배포 버튼 → 노션 → 정적 HTML 빌드 → Cloudflare 배포 완료
-- [ ] sitemap, RSS, robots.txt 자동 생성
+- [ ] **온보딩 2단계 위저드 완료** (기존 4단계에서 간소화)
+- [ ] 배포 버튼 → **Workers** → 노션 → 정적 HTML 빌드 → Cloudflare 배포 완료
+- [ ] sitemap, RSS, robots.txt, **TOC (선택사항)** 자동 생성
 - [ ] 커스텀 도메인 + SSL 작동
 - [ ] Lighthouse 성능 90+ 달성
-- [ ] Paddle checkout → 구독 활성화 → 웹훅 처리
-- [ ] 14일 체험 + 배포 횟수 제한 작동
-- [ ] 대시보드 5개 화면 모두 작동
+- [ ] Paddle checkout → **Pro 구독** 활성화 → 웹훅 처리
+- [ ] **7일 체험** + D-3/D-1 푸시 + 배포 횟수 제한 작동
+- [ ] **빌드 모니터링 대시보드** (실패율, 평균 빌드 시간)
+- [ ] **FAQ + 이메일 문의 폼** 작동
+- [ ] **UptimeRobot 상태 페이지 연동**
 
 ### Phase 1 — 유저 10명 확보 후
 
@@ -1590,8 +1659,9 @@ NOTION_CLIENT_ID=
 NOTION_CLIENT_SECRET=
 NOTION_REDIRECT_URI=
 
-# === 암호화 ===
-ENCRYPTION_KEY=                    # 64자 hex (32바이트 AES-256 키)
+# === 암호화 (버전 관리) ===
+ENCRYPTION_KEY_V1=                 # 64자 hex (32바이트 AES-256 키) - 초기 키
+ENCRYPTION_KEY_V2=                 # 64자 hex - 로테이션 시 추가 (선택)
 
 # === Cloudflare ===
 CLOUDFLARE_ACCOUNT_ID=
@@ -1600,22 +1670,137 @@ CLOUDFLARE_R2_ACCESS_KEY_ID=
 CLOUDFLARE_R2_SECRET_ACCESS_KEY=
 CLOUDFLARE_R2_BUCKET=
 
-# === Paddle ===
+# === Paddle (Phase 0: Pro만) ===
 PADDLE_API_KEY=
 PADDLE_WEBHOOK_SECRET=
 PADDLE_CLIENT_TOKEN=               # 프론트엔드 Paddle.js용
 PADDLE_PRO_MONTHLY_PRICE_ID=
 PADDLE_PRO_ANNUAL_PRICE_ID=
-PADDLE_BUSINESS_MONTHLY_PRICE_ID=
-PADDLE_BUSINESS_ANNUAL_PRICE_ID=
+
+# === 빌드 서버 (Cloudflare Workers) ===
+CF_WORKERS_URL=                    # 빌드 파이프라인 Workers URL
+WORKERS_AUTH_TOKEN=                # Workers Bearer Token 인증
+WORKERS_CALLBACK_URL=              # 빌드 완료 콜백 URL (Vercel API)
 
 # === 기타 ===
 NEXT_PUBLIC_BASE_URL=              # https://app.noble.blog
 SENTRY_DSN=                        # 에러 트래킹 (선택)
-RESEND_API_KEY=                    # 이메일 발송 (선택)
+RESEND_API_KEY=                    # 이메일 발송 (필수: 토큰 revoke 알림, 체험 만료 푸시)
+UPTIMEROBOT_API_KEY=               # 상태 페이지 연동 (선택)
 ```
 
 ---
 
-*Noble PRD v2.0 — 2025-02-13*
+## 16. 기술 스펙 확정 (v2.2)
+
+> 40개 기술 의사결정 사항 (17개 주요 의사결정 + 23개 상세 정의)
+
+### 16.1 Workers 통신 및 빌드
+
+| ID | 항목 | 확정 스펙 |
+|----|------|----------|
+| D-1 | Vercel ↔ Workers 통신 | **HTTP + 콜백** 방식. Vercel → Workers 호출, 완료 시 Workers → Vercel 콜백 |
+| D-2 | Workers 인증 | **Bearer Token** (WORKERS_AUTH_TOKEN 환경변수) |
+| D-3 | 빌드 상태 조회 | **Workers → Vercel 콜백** (빌드 완료/실패 시 Vercel API 호출) |
+| D-10 | 빌드 중복 요청 | 기존 빌드 완료까지 **대기 후 새 빌드** (중복 생성 방지) |
+| D-11 | 첫 빌드 트리거 | **온보딩 완료 시** 자동 트리거 |
+| S-2 | 빌드 상태 전이 | queued(0) → building(3분) → deploying(2분) → success/failed |
+| S-3 | 빌드 타임아웃 | **5분** (300초) |
+
+### 16.2 결제 및 구독
+
+| ID | 항목 | 확정 스펙 |
+|----|------|----------|
+| D-4 | 구독 취소 후 | 기간 만료까지 **블로그 유지**, 만료 후 비활성화 |
+| D-5 | Past Due 유예 | **7일 유예** 후 구독 일시중지 |
+| D-6 | 구독 만료 데이터 | **30일 보관** 후 삭제 (사용자에게 명확히 안내) |
+| S-6 | 결제 상태 전이 | trialing → active → past_due(7일) → paused → canceled |
+| S-18 | 환불 정책 | 14일 이내 전액 자동, 14일 초과 수동 검토 |
+
+### 16.3 Notion 연동
+
+| ID | 항목 | 확정 스펙 |
+|----|------|----------|
+| D-7 | DB 변경 시 기존 포스트 | **삭제 (안내)** + 내부 90일 보관 (CS 복구용) |
+| D-8 | 기존 글 동기화 | **자동 동기화 + 변경 로그** (Notion last_edited_time 비교) |
+| D-12 | OAuth 토큰 만료 | **1시간** 유지 (쿠키 SameSite=Lax, HttpOnly, Secure) |
+| S-8 | OAuth State 쿠키 | HttpOnly, Secure, SameSite=Lax, Max-Age=3600 |
+
+### 16.4 이미지 처리
+
+| ID | 항목 | 확정 스펙 |
+|----|------|----------|
+| D-9 | 전체 이미지 실패 | **빌드 성공** 처리 (placeholder 삽입, 에러 로그) |
+| S-4 | 이미지 타임아웃 | 다운로드 10초, 처리 5초, 업로드 15초 |
+| S-5 | 이미지 해시 | **SHA256** (콘텐츠 해시 기반 중복 방지) |
+| S-7 | R2 접근 정책 | **Public Read** (CDN 직접 접근, 개별 권한 체크 없음) |
+
+### 16.5 보안 및 암호화
+
+| ID | 항목 | 확정 스펙 |
+|----|------|----------|
+| S-15 | 암호화 키 관리 | **Phase 0부터 버전 관리** (encryption_version 컬럼, ENCRYPTION_KEY_V1/V2) |
+| S-17 | Rate Limiting | 인증 유저: 60 req/분, 비인증 IP: 20 req/분 |
+| S-19 | Paddle 웹훅 | 5분 타임스탬프 검증 + event_id 중복 체크 |
+
+### 16.6 캐싱 및 로깅
+
+| ID | 항목 | 확정 스펙 |
+|----|------|----------|
+| D-16 | 빌드 로그 보관 | **90일 + 요약** (상세 로그 90일 후 삭제, 통계/요약 영구) |
+| D-17 | 에러 로깅 | **Phase 0 서버만** (console.error + Sentry), 프론트엔드 Phase 1 |
+| S-20 | 웹훅 실패 로그 | **최종 결과만** 기록 (재시도 과정 미기록) |
+| S-21 | SWR 캐시 전략 | 엔드포인트별 설정 (/api/site: 30초, /api/posts: 60초, /api/build/status: 2-10초 폴링) |
+
+### 16.7 알림 및 이메일
+
+| ID | 항목 | 확정 스펙 |
+|----|------|----------|
+| D-13 | Notion 연결 해제 후 알림 | **불필요** (재연결 시 자동 이메일) |
+| D-14 | 빌드 완료 이메일 | **Reply-To** (노트 기능 미지원, 이메일 회신 안내) |
+| D-15 | 빌드 실패 알림 채널 | **Notion + Cloudflare 실패만** 이메일 발송 |
+| S-10 | 일일 배포 리셋 | **UTC 00:00** 기준 |
+
+### 16.8 기타 확정 사항
+
+| ID | 항목 | 확정 스펙 |
+|----|------|----------|
+| S-1 | 체험 기간 | 7일 (D-3, D-1 이메일 푸시) |
+| S-9 | 폴링 간격 | 0-30초: 2초, 30-120초: 5초, 120-300초: 10초, 300초+: 중단 |
+| S-11 | 서브도메인 예약어 | admin, api, www, app, dashboard, blog, help, support, status, mail, noble |
+| S-12 | 커스텀 도메인 | CNAME → noble-cdn.pages.dev, SSL 자동 발급 |
+| S-13 | TOC 생성 조건 | toc_enabled=true + 3개 이상 헤딩 |
+| S-14 | 글 목록 정렬 | 수정일 최신순 고정 (정렬 옵션 없음) |
+| S-16 | DB 필수 속성 | Title(title), Slug(rich_text), Status(select + "Published" 옵션) |
+| S-22 | 에러 메시지 | 구체적 원인 + 해결책 (한국어, "문제가 발생했습니다" 금지) |
+| S-23 | 멱등성 키 | 24시간 유효, UUID v4, endpoint별 캐시 |
+
+---
+
+*Noble PRD v2.2 — 2025-02-13*
 *Ship fast, iterate based on user feedback.*
+
+**v2.2 변경 사항:**
+- 40개 기술 스펙 확정 (17개 의사결정 + 23개 상세 정의)
+- Workers 통신: HTTP + 콜백 방식, Bearer Token 인증
+- 암호화 키 버전 관리 (ENCRYPTION_KEY_V1/V2)
+- Past Due 7일 유예 기간
+- 이미지 타임아웃 상세 정의 (다운로드 10초, 처리 5초, 업로드 15초)
+- R2 Public Read 정책
+- Rate Limiting 정책 추가
+- SWR 캐시 전략 엔드포인트별 정의
+
+**v2.1 변경 사항:**
+- 온보딩 4단계 → 2단계
+- 체험 14일 → 7일 (D-3, D-1 푸시 강화)
+- 설정 탭 4개 → 2개 (일반/결제)
+- FAB 상태 5개 → 3개 (idle/building/done)
+- 빌드 파이프라인 Cloudflare Workers 분리 (Vercel 타임아웃 회피)
+- Cloudflare Pages Pro $20/월 (Day 1부터)
+- Phase 0: Pro 플랜만 (Business는 Phase 1)
+- 빌드 모니터링 대시보드 추가 (실패율, 평균 빌드 시간)
+- FAQ + 이메일 문의 폼 추가
+- Notion 토큰 revoke 시 자동 이메일
+- UptimeRobot 상태 페이지 연동
+- TOC 목차 유저 선택 사항
+- sharp 서버리스 호환성 방안 3가지 명시
